@@ -1,6 +1,6 @@
 [package]
 name = "brightwheel-tray"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "BrightWheel - tray brightness control for every Windows monitor"
 publish = false
@@ -12,9 +12,16 @@ path = "src/main.rs"
 [dependencies]
 slint = { version = "=1.18.0", features = ["unstable-winit-030"] }
 tray-icon = "0.21.3"
-brightwheel = "0.1.9"
 brightness = { version = "0.8.0", default-features = false, features = ["blocking"] }
 anyhow = "1"
+winreg = "0.55"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 
 [build-dependencies]
 slint-build = "=1.18.0"

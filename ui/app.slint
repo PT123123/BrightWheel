@@ -1,4 +1,4 @@
-import { Button, CheckBox, Slider } from "std-widgets.slint";
+import { Button, CheckBox } from "std-widgets.slint";
 
 export struct MonitorItem {
     index: int,
@@ -8,117 +8,359 @@ export struct MonitorItem {
     detail: string,
 }
 
+// Compact text button used by the tray panel. No icons, per the design brief.
+component PanelButton inherits Rectangle {
+    in property <string> label: "";
+    in property <bool> emphasized: false;
+    callback clicked;
+
+    width: 56px;
+    height: 28px;
+    border-radius: 8px;
+    background: touch.has-hover ? (root.emphasized ? #3a9bff : #ffffff1f) : (root.emphasized ? #0a84ff : #ffffff0d);
+    animate background { duration: 110ms; }
+
+    Text {
+        text: root.label;
+        color: #f5f5f7;
+        font-size: 12px;
+        font-weight: 500;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Slim iOS-style slider: click anywhere on the track to jump, drag to adjust,
+// and use the mouse wheel for fine steps.
+component BrightnessSlider inherits Rectangle {
+    in property <float> target: 50;
+    in property <bool> enabled: true;
+    callback changed(float);
+    callback released(float);
+
+    height: 22px;
+    min-width: 60px;
+
+    private property <float> live: target;
+    private property <length> handle-size: 14px;
+    private property <length> track-width: max(0px, root.width - root.handle-size);
+    private property <float> ratio: root.enabled ? clamp(root.live / 100, 0, 1) : 0;
+
+    changed target => {
+        if (!touch.pressed) {
+            live = target;
+        }
+    }
+
+    rail := Rectangle {
+        x: root.handle-size / 2;
+        y: (root.height - 4px) / 2;
+        width: root.track-width;
+        height: 4px;
+        border-radius: 2px;
+        background: root.enabled ? #ffffff29 : #ffffff12;
+    }
+
+    fill := Rectangle {
+        x: rail.x;
+        y: rail.y;
+        width: rail.width * root.ratio;
+        height: rail.height;
+        border-radius: rail.border-radius;
+        background: root.enabled ? #0a84ff : #ffffff3d;
+    }
+
+    thumb := Rectangle {
+        x: clamp(rail.x + rail.width * root.ratio - root.handle-size / 2, 0px, root.width - root.handle-size);
+        y: (root.height - root.handle-size) / 2;
+        width: root.handle-size;
+        height: root.handle-size;
+        border-radius: root.handle-size / 2;
+        background: root.enabled ? #ffffff : #9a9aa0;
+        drop-shadow-blur: 5px;
+        drop-shadow-offset-y: 1px;
+        drop-shadow-color: #00000080;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+
+        pointer-event(event) => {
+            if (event.button != PointerEventButton.left) {
+                return;
+            }
+            if (event.kind == PointerEventKind.down) {
+                root.set-from-x(self.mouse-x);
+            } else if (event.kind == PointerEventKind.up) {
+                root.released(root.live);
+            }
+        }
+
+        moved => {
+            if (self.pressed) {
+                root.set-from-x(self.mouse-x);
+            }
+        }
+
+        scroll-event(event) => {
+            if (!root.enabled) {
+                return reject;
+            }
+            root.live = clamp(root.live + (event.delta-y < 0px ? 5 : -5), 0, 100);
+            root.changed(root.live);
+            root.released(root.live);
+            accept
+        }
+    }
+
+    public function set-from-x(pointer-x: length) {
+        if (!root.enabled || root.track-width <= 0px) {
+            return;
+        }
+        let fraction = clamp((pointer-x - root.handle-size / 2) / root.track-width, 0, 1);
+        root.live = round(fraction * 100);
+        root.changed(root.live);
+    }
+}
+
 export component MainWindow inherits Window {
     in property <[MonitorItem]> monitors;
     in property <string> status-text: "";
     in property <bool> show-percent: true;
+    in property <bool> has-master: false;
+    in property <int> master-percent: 100;
+    in property <int> supported-count: 0;
+    in property <bool> scanning: false;
 
     callback brightness-changed(int, float);
+    callback brightness-released(int, float);
+    callback master-changed(float);
+    callback master-released(float);
     callback open-settings();
     callback do-refresh();
     callback do-quit();
+    callback request-hide();
 
-    width: 360px;
-    height: 190px;
-    background: #16171a;
+    width: 372px;
+    height: 298px;
+    no-frame: true;
+    always-on-top: true;
+    background: #14161b;
     default-font-family: "Segoe UI";
+    forward-focus: key-handler;
+
+    key-handler := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.request-hide();
+                return accept;
+            }
+            reject
+        }
+    }
 
     VerticalLayout {
+        spacing: 0px;
+
         Rectangle {
-            height: 50px;
-            background: #24262b;
+            height: 58px;
+            background: #17191f;
+
             HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 10px;
-                spacing: 6px;
-                Text {
-                    text: "BrightWheel";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #f0f0f0;
-                    vertical-alignment: center;
+                padding-left: 18px;
+                padding-right: 12px;
+                padding-top: 10px;
+                padding-bottom: 10px;
+                spacing: 8px;
+
+                VerticalLayout {
+                    spacing: 1px;
+                    horizontal-stretch: 1;
+                    alignment: center;
+
+                    Text {
+                        text: "BrightWheel";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: #f5f5f7;
+                        vertical-alignment: center;
+                    }
+
+                    Text {
+                        text: root.scanning ? "正在扫描显示器…" : (root.supported-count > 0 ? root.supported-count + " 台显示器可调" : "未检测到可调显示器");
+                        font-size: 11px;
+                        color: #8e8e93;
+                        vertical-alignment: center;
+                    }
                 }
-                Rectangle { horizontal-stretch: 1; }
-                Button {
-                    text: "刷新";
-                    width: 52px;
-                    height: 30px;
+
+                PanelButton {
+                    label: "刷新";
                     clicked => { root.do-refresh(); }
                 }
-                Button {
-                    text: "设置";
-                    width: 52px;
-                    height: 30px;
+
+                PanelButton {
+                    label: "设置";
                     clicked => { root.open-settings(); }
-                }
-                Button {
-                    text: "退出";
-                    width: 52px;
-                    height: 30px;
-                    clicked => { root.do-quit(); }
                 }
             }
         }
 
         VerticalLayout {
-            padding-left: 10px;
-            padding-right: 10px;
+            padding-left: 14px;
+            padding-right: 14px;
             padding-top: 10px;
-            padding-bottom: 6px;
+            padding-bottom: 10px;
             spacing: 8px;
+            vertical-stretch: 1;
 
-            for item in root.monitors: Rectangle {
-                height: 66px;
-                background: #25272c;
-                border-radius: 8px;
+            if root.has-master: Rectangle {
+                height: 56px;
+                border-radius: 10px;
+                background: #0a84ff1f;
+                border-width: 1px;
+                border-color: #0a84ff33;
+
                 VerticalLayout {
                     padding-left: 12px;
                     padding-right: 12px;
                     padding-top: 7px;
                     padding-bottom: 7px;
                     spacing: 4px;
+
                     HorizontalLayout {
+                        Text {
+                            text: "所有显示器";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: #cfe4ff;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: root.show-percent ? root.master-percent + "%" : "";
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: #7fb8ff;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    BrightnessSlider {
+                        target: root.master-percent;
+                        changed(value) => { root.master-changed(value); }
+                        released(value) => { root.master-released(value); }
+                    }
+                }
+            }
+
+            for item in root.monitors: Rectangle {
+                height: 58px;
+                border-radius: 10px;
+                background: #1d2027;
+                border-width: 1px;
+                border-color: #ffffff0a;
+
+                VerticalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 7px;
+                    padding-bottom: 7px;
+                    spacing: 4px;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+
                         Text {
                             text: item.name;
                             font-size: 12px;
-                            color: #e6e6e6;
+                            color: item.supported ? #ececf0 : #8e8e93;
                             horizontal-stretch: 1;
                             vertical-alignment: center;
                             overflow: elide;
                         }
+
                         Text {
                             text: !item.supported ? "不支持" : (root.show-percent ? item.percent + "%" : "");
                             font-size: 12px;
-                            color: #ffd45e;
+                            font-weight: 600;
+                            color: item.supported ? #7fb8ff : #6f6f76;
                             vertical-alignment: center;
                         }
                     }
-                    if item.supported: Slider {
-                        minimum: 0;
-                        maximum: 100;
-                        value: item.percent;
-                        changed => { root.brightness-changed(item.index, self.value); }
+
+                    if item.supported: BrightnessSlider {
+                        target: item.percent;
+                        changed(value) => { root.brightness-changed(item.index, value); }
+                        released(value) => { root.brightness-released(item.index, value); }
                     }
+
                     if !item.supported: Text {
                         text: item.detail;
                         font-size: 10px;
-                        color: #9a9a9a;
+                        color: #7c7c83;
                         overflow: elide;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.monitors.length == 0: Rectangle {
+                height: 96px;
+                border-radius: 10px;
+                background: #1d2027;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 6px;
+
+                    Text {
+                        text: "未检测到显示器";
+                        font-size: 13px;
+                        color: #d0d0d6;
+                        horizontal-alignment: center;
+                    }
+
+                    Text {
+                        text: "点击「刷新」重新扫描，或检查显示器连接";
+                        font-size: 10px;
+                        color: #7c7c83;
+                        horizontal-alignment: center;
                     }
                 }
             }
         }
 
         Rectangle {
-            height: 30px;
-            background: #1d1f23;
+            height: 32px;
+            background: #17191f;
+
             HorizontalLayout {
-                padding-left: 14px;
+                padding-left: 16px;
+                padding-right: 10px;
+                spacing: 8px;
+
                 Text {
                     text: root.status-text;
-                    font-size: 11px;
-                    color: #9a9a9a;
+                    font-size: 10px;
+                    color: #7c7c83;
                     vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                PanelButton {
+                    label: "退出";
+                    width: 46px;
+                    height: 24px;
+                    clicked => { root.do-quit(); }
                 }
             }
         }
@@ -129,69 +371,116 @@ export component SettingsWindow inherits Window {
     in property <bool> autostart-enabled;
     in property <bool> show-percent;
     in property <string> version-text: "";
+    in property <string> notice-text: "";
 
     callback autostart-changed(bool);
     callback show-percent-changed(bool);
     callback do-refresh();
     callback do-quit();
-    callback close-requested();
+    callback hide-window();
 
-    width: 400px;
-    height: 260px;
-    title: "设置 - BrightWheel";
-    background: #f3f3f3;
+    width: 420px;
+    height: 380px;
+    title: "BrightWheel 设置";
+    background: #f5f5f7;
     default-font-family: "Segoe UI";
 
     VerticalLayout {
-        padding: 18px;
+        padding: 22px;
         spacing: 14px;
 
         Text {
             text: "设置";
-            font-size: 18px;
+            font-size: 20px;
             font-weight: 600;
-            color: #202124;
-        }
-
-        Rectangle {
-            height: 1px;
-            background: #d8d8d8;
-        }
-
-        CheckBox {
-            text: "开机时自动启动";
-            checked: root.autostart-enabled;
-            toggled => { root.autostart-changed(self.checked); }
-        }
-
-        CheckBox {
-            text: "在亮度滑块旁显示百分比";
-            checked: root.show-percent;
-            toggled => { root.show-percent-changed(self.checked); }
+            color: #1d1d1f;
         }
 
         Text {
-            text: root.version-text;
+            text: "多显示器亮度控制";
             font-size: 11px;
-            color: #808080;
+            color: #86868b;
+        }
+
+        Rectangle {
+            height: 112px;
+            border-radius: 12px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #00000012;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 14px;
+
+                CheckBox {
+                    text: "开机时自动启动";
+                    checked: root.autostart-enabled;
+                    toggled => { root.autostart-changed(self.checked); }
+                }
+
+                CheckBox {
+                    text: "在亮度滑块旁显示百分比";
+                    checked: root.show-percent;
+                    toggled => { root.show-percent-changed(self.checked); }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 64px;
+            border-radius: 12px;
+            background: #ffffff;
+            border-width: 1px;
+            border-color: #00000012;
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 10px;
+
+                Text {
+                    text: "显示器";
+                    font-size: 12px;
+                    color: #1d1d1f;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: "重新扫描显示器";
+                    height: 30px;
+                    clicked => { root.do-refresh(); }
+                }
+            }
         }
 
         Rectangle { vertical-stretch: 1; }
 
         HorizontalLayout {
             spacing: 8px;
-            Button {
-                text: "重新扫描显示器";
-                clicked => { root.do-refresh(); }
+
+            Text {
+                text: root.notice-text != "" ? root.notice-text : root.version-text;
+                font-size: 10px;
+                color: root.notice-text != "" ? #c2410c : #9a9aa0;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
             }
+
             Button {
                 text: "退出";
+                height: 30px;
+                width: 64px;
                 clicked => { root.do-quit(); }
             }
-            Rectangle { horizontal-stretch: 1; }
+
             Button {
                 text: "关闭";
-                clicked => { root.close-requested(); }
+                height: 30px;
+                width: 64px;
+                clicked => { root.hide-window(); }
             }
         }
     }
