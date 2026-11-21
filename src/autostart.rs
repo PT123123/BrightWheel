@@ -74,3 +74,19 @@ pub fn reconcile() -> Result<()> {
     }
     Ok(())
 }
+
+/// Human-readable status shown in the Settings window.
+pub fn detail_text() -> String {
+    match registered_command() {
+        None => "当前未启用开机自启".to_string(),
+        Some(command) => {
+            let state = if is_enabled() { "已启用" } else { "状态异常" };
+            let freshness = if is_current() {
+                "指向当前版本"
+            } else {
+                "指向旧版本，启动时自动更新"
+            };
+            format!("{state} · {freshness} · {command}")
+        }
+    }
+}

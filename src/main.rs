@@ -447,6 +447,11 @@ fn configure_settings_window(window: &slint::Window) {
     });
 }
 
+fn refresh_settings(window: &SettingsWindow) {
+    window.set_autostart_enabled(autostart::is_enabled());
+    window.set_autostart_detail(autostart::detail_text().into());
+}
+
 fn enumerate_devices() -> Vec<DeviceEntry> {
     let mut entries = Vec::new();
     for result in brightness_devices() {
@@ -691,6 +696,7 @@ fn main() -> Result<()> {
     settings.set_autostart_enabled(autostart::is_enabled());
     // Versioned deploy folders move the exe on every upgrade; keep the Run key fresh.
     let _ = autostart::reconcile();
+    settings.set_autostart_detail(autostart::detail_text().into());
 
     let hub = spawn_worker(main_win.as_weak());
     STATE.with(|cell| cell.borrow_mut().hub = Some(hub.clone()));
@@ -798,6 +804,7 @@ fn main() -> Result<()> {
         }
         STATE.with(|cell| cell.borrow_mut().visible = false);
         if let Some(window) = settings_opener.upgrade() {
+            refresh_settings(&window);
             let _ = window.window().show();
             configure_settings_window(window.window());
         }
@@ -819,13 +826,23 @@ fn main() -> Result<()> {
 
     let autostart_weak = settings_weak.clone();
     settings.on_autostart_changed(move |enabled| {
-        if let Err(error) = autostart::set_enabled(enabled) {
-            if let Some(window) = autostart_weak.upgrade() {
-                window.set_autostart_enabled(!enabled);
+        let result = autostart::set_enabled(enabled);
+        if let Some(window) = autostart_weak.upgrade() {
+            if let Err(error) = result {
                 window.set_notice_text(format!("开机自启设置失败：{error}").into());
+            } else {
+                window.set_notice_text("".into());
             }
-        } else if let Some(window) = autostart_weak.upgrade() {
+            refresh_settings(&window);
+        }
+    });
+
+    let check_autostart_weak = settings_weak.clone();
+    settings.on_check_autostart(move || {
+        let _ = autostart::reconcile();
+        if let Some(window) = check_autostart_weak.upgrade() {
             window.set_notice_text("".into());
+            refresh_settings(&window);
         }
     });
 
@@ -902,6 +919,7 @@ fn main() -> Result<()> {
                 }
                 STATE.with(|cell| cell.borrow_mut().visible = false);
                 if let Some(window) = settings.upgrade() {
+                    refresh_settings(&window);
                     let _ = window.window().show();
                     configure_settings_window(window.window());
                 }

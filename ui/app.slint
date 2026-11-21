@@ -372,15 +372,17 @@ export component SettingsWindow inherits Window {
     in property <bool> show-percent;
     in property <string> version-text: "";
     in property <string> notice-text: "";
+    in property <string> autostart-detail: "";
 
     callback autostart-changed(bool);
     callback show-percent-changed(bool);
+    callback check-autostart();
     callback do-refresh();
     callback do-quit();
     callback hide-window();
 
     width: 420px;
-    height: 380px;
+    height: 400px;
     title: "BrightWheel 设置";
     background: #f5f5f7;
     default-font-family: "Segoe UI";
@@ -397,13 +399,13 @@ export component SettingsWindow inherits Window {
         }
 
         Text {
-            text: "多显示器亮度控制";
+            text: "多显示器亮度控制 · 关闭后仍驻留系统托盘";
             font-size: 11px;
             color: #86868b;
         }
 
         Rectangle {
-            height: 112px;
+            height: 146px;
             border-radius: 12px;
             background: #ffffff;
             border-width: 1px;
@@ -411,7 +413,7 @@ export component SettingsWindow inherits Window {
 
             VerticalLayout {
                 padding: 16px;
-                spacing: 14px;
+                spacing: 10px;
 
                 CheckBox {
                     text: "开机时自动启动";
@@ -423,6 +425,25 @@ export component SettingsWindow inherits Window {
                     text: "在亮度滑块旁显示百分比";
                     checked: root.show-percent;
                     toggled => { root.show-percent-changed(self.checked); }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: root.autostart-detail;
+                        font-size: 10px;
+                        color: #86868b;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+
+                    Button {
+                        text: "检查自启";
+                        height: 26px;
+                        clicked => { root.check-autostart(); }
+                    }
                 }
             }
         }
