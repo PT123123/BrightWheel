@@ -303,6 +303,16 @@ fn refresh_master(win: &MainWindow, state: &AppState) {
     }
 }
 
+fn merged_percent(preserving: bool, old: Option<&MonitorItem>, monitor: &MonSnapshot) -> i32 {
+    if preserving && monitor.supported {
+        old.filter(|item| item.supported)
+            .map(|item| item.percent)
+            .unwrap_or(monitor.percent as i32)
+    } else {
+        monitor.percent as i32
+    }
+}
+
 fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: SnapshotReason) {
     STATE.with(|cell| {
         let state = cell.borrow();
@@ -312,20 +322,11 @@ fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: Snapshot
 
         let mut items = Vec::with_capacity(snapshot.len());
         for (index, monitor) in snapshot.iter().enumerate() {
-            let percent = if preserving && monitor.supported {
-                state
-                    .model
-                    .row_data(index)
-                    .filter(|old| old.supported)
-                    .map(|old| old.percent)
-                    .unwrap_or(monitor.percent as i32)
-            } else {
-                monitor.percent as i32
-            };
+            let old = state.model.row_data(index);
             items.push(MonitorItem {
                 index: index as i32,
                 name: monitor.name.as_str().into(),
-                percent,
+                percent: merged_percent(preserving, old.as_ref(), monitor),
                 supported: monitor.supported,
                 detail: monitor.detail.as_str().into(),
             });
@@ -1146,15 +1147,52 @@ mod tests {
 
     #[test]
     fn snapshot_merging_respects_recent_user_input() {
-        // Pure logic mirror: while a drag is in progress, a polled snapshot must
-        // not overwrite the percentage the user is currently holding.
+        let old = MonitorItem {
+            index: 0,
+            name: "1. Test".into(),
+            percent: 40,
+            supported: true,
+            detail: "".into(),
+        };
+        let polled = MonSnapshot {
+            name: "1. Test".into(),
+            percent: 70,
+            supported: true,
+            detail: "".into(),
+        };
+
+        // While the user is dragging, keep the value they are holding.
+        assert_eq!(merged_percent(true, Some(&old), &polled), 40);
+        // Without recent input, the polled hardware value wins.
+        assert_eq!(merged_percent(false, Some(&old), &polled), 70);
+        // Nothing to preserve yet.
+        assert_eq!(merged_percent(true, None, &polled), 70);
+
+        let unsupported_old = MonitorItem {
+            index: 0,
+            name: "1. Test".into(),
+            percent: 0,
+            supported: false,
+            detail: "no ddc".into(),
+        };
+        assert_eq!(merged_percent(true, Some(&unsupported_old), &polled), 70);
+
+        let unsupported_poll = MonSnapshot {
+            name: "1. Test".into(),
+            percent: 0,
+            supported: false,
+            detail: "no ddc".into(),
+        };
+        assert_eq!(merged_percent(true, Some(&old), &unsupported_poll), 0);
+    }
+
+    #[test]
+    fn interaction_grace_expires() {
         let recent = Some(Instant::now());
-        let preserving = recent.is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE);
-        assert!(preserving);
+        assert!(recent.is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE));
 
         let old = Some(Instant::now() - INTERACTION_GRACE - Duration::from_millis(10));
-        let preserving = old.is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE);
-        assert!(!preserving);
+        assert!(!old.is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE));
     }
 }
 
