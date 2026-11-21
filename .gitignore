@@ -1,0 +1,4 @@
+/target
+/.workbuddy/
+*.res
+.DS_Store

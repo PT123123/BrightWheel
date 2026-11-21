@@ -1,0 +1,198 @@
+import { Button, CheckBox, Slider } from "std-widgets.slint";
+
+export struct MonitorItem {
+    index: int,
+    name: string,
+    percent: int,
+    supported: bool,
+    detail: string,
+}
+
+export component MainWindow inherits Window {
+    in property <[MonitorItem]> monitors;
+    in property <string> status-text: "";
+    in property <bool> show-percent: true;
+
+    callback brightness-changed(int, float);
+    callback open-settings();
+    callback do-refresh();
+    callback do-quit();
+
+    width: 360px;
+    height: 190px;
+    background: #16171a;
+    default-font-family: "Segoe UI";
+
+    VerticalLayout {
+        Rectangle {
+            height: 50px;
+            background: #24262b;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 10px;
+                spacing: 6px;
+                Text {
+                    text: "BrightWheel";
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: #f0f0f0;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: "刷新";
+                    width: 52px;
+                    height: 30px;
+                    clicked => { root.do-refresh(); }
+                }
+                Button {
+                    text: "设置";
+                    width: 52px;
+                    height: 30px;
+                    clicked => { root.open-settings(); }
+                }
+                Button {
+                    text: "退出";
+                    width: 52px;
+                    height: 30px;
+                    clicked => { root.do-quit(); }
+                }
+            }
+        }
+
+        VerticalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 10px;
+            padding-bottom: 6px;
+            spacing: 8px;
+
+            for item in root.monitors: Rectangle {
+                height: 66px;
+                background: #25272c;
+                border-radius: 8px;
+                VerticalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    padding-top: 7px;
+                    padding-bottom: 7px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        Text {
+                            text: item.name;
+                            font-size: 12px;
+                            color: #e6e6e6;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: !item.supported ? "不支持" : (root.show-percent ? item.percent + "%" : "");
+                            font-size: 12px;
+                            color: #ffd45e;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if item.supported: Slider {
+                        minimum: 0;
+                        maximum: 100;
+                        value: item.percent;
+                        changed => { root.brightness-changed(item.index, self.value); }
+                    }
+                    if !item.supported: Text {
+                        text: item.detail;
+                        font-size: 10px;
+                        color: #9a9a9a;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 30px;
+            background: #1d1f23;
+            HorizontalLayout {
+                padding-left: 14px;
+                Text {
+                    text: root.status-text;
+                    font-size: 11px;
+                    color: #9a9a9a;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+export component SettingsWindow inherits Window {
+    in property <bool> autostart-enabled;
+    in property <bool> show-percent;
+    in property <string> version-text: "";
+
+    callback autostart-changed(bool);
+    callback show-percent-changed(bool);
+    callback do-refresh();
+    callback do-quit();
+    callback close-requested();
+
+    width: 400px;
+    height: 260px;
+    title: "设置 - BrightWheel";
+    background: #f3f3f3;
+    default-font-family: "Segoe UI";
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 14px;
+
+        Text {
+            text: "设置";
+            font-size: 18px;
+            font-weight: 600;
+            color: #202124;
+        }
+
+        Rectangle {
+            height: 1px;
+            background: #d8d8d8;
+        }
+
+        CheckBox {
+            text: "开机时自动启动";
+            checked: root.autostart-enabled;
+            toggled => { root.autostart-changed(self.checked); }
+        }
+
+        CheckBox {
+            text: "在亮度滑块旁显示百分比";
+            checked: root.show-percent;
+            toggled => { root.show-percent-changed(self.checked); }
+        }
+
+        Text {
+            text: root.version-text;
+            font-size: 11px;
+            color: #808080;
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: "重新扫描显示器";
+                clicked => { root.do-refresh(); }
+            }
+            Button {
+                text: "退出";
+                clicked => { root.do-quit(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "关闭";
+                clicked => { root.close-requested(); }
+            }
+        }
+    }
+}

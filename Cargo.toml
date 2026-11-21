@@ -1,0 +1,26 @@
+[package]
+name = "brightwheel-tray"
+version = "0.2.1"
+edition = "2024"
+description = "BrightWheel - tray brightness control for every Windows monitor"
+publish = false
+
+[[bin]]
+name = "BrightWheel"
+path = "src/main.rs"
+
+[dependencies]
+slint = { version = "=1.18.0", features = ["unstable-winit-030"] }
+tray-icon = "0.21.3"
+brightwheel = "0.1.9"
+brightness = { version = "0.8.0", default-features = false, features = ["blocking"] }
+anyhow = "1"
+
+[build-dependencies]
+slint-build = "=1.18.0"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+strip = true
+panic = "abort"
