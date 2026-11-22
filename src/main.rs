@@ -1,6 +1,11 @@
+// Release builds are tray-resident GUI apps: a console subsystem makes Windows
+// open a black cmd window on launch. Tests keep the console for diagnostics.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 slint::include_modules!();
 
 mod autostart;
+mod single_instance;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -905,32 +910,6 @@ fn toggle_popup(weak: &slint::Weak<MainWindow>, rect: &Rect) {
 }
 
 #[cfg(windows)]
-fn already_running() -> bool {
-    use std::sync::OnceLock;
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
-
-    static MUTEX: OnceLock<usize> = OnceLock::new();
-    let name: Vec<u16> = "Local\\BrightWheel.SingleInstance\0".encode_utf16().collect();
-    unsafe {
-        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-        if handle.is_null() {
-            return false;
-        }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            return true;
-        }
-        let _ = MUTEX.set(handle as usize);
-        false
-    }
-}
-
-#[cfg(not(windows))]
-fn already_running() -> bool {
-    false
-}
-
-#[cfg(windows)]
 fn primary_screen_size() -> (i32, i32) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
@@ -955,9 +934,11 @@ fn foreground_hwnd() -> isize {
 }
 
 fn main() -> Result<()> {
-    if already_running() {
-        return Ok(());
-    }
+    // Take ownership and, if an older build is resident, ask it to retire
+    // gracefully. Install the listener only after we own the mutex so an old
+    // instance cannot make the incoming build quit instead of itself.
+    let _instance = single_instance::acquire(Duration::from_secs(3))?;
+    single_instance::install_quit_listener()?;
 
     slint::BackendSelector::new()
         .backend_name("winit".into())
