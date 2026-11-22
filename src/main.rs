@@ -3,7 +3,7 @@ slint::include_modules!();
 mod autostart;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
@@ -62,10 +62,14 @@ enum Command {
     Poll,
     Set { index: usize, percent: u32 },
     SetAll { percent: u32 },
+    /// Dev-only: forces the last monitor into the "unwritable" state so the
+    /// failure UI can be checked without broken hardware.
+    DevFailLast,
 }
 
 struct DeviceEntry {
     device: Option<BrightnessDevice>,
+    key: String,
     name: String,
     percent: u32,
     supported: bool,
@@ -78,6 +82,11 @@ struct AppState {
     pending: HashMap<usize, u32>,
     pending_all: Option<u32>,
     last_touch: Option<Instant>,
+    /// Sticky Chinese message shown after a DDC/CI write failure, so the
+    /// periodic poll does not immediately replace it with "亮度已同步".
+    failed_notice: Option<String>,
+    /// Native handle of the popup panel, used to detect focus loss.
+    panel_hwnd: Option<isize>,
     visible: bool,
     tray_rect: Option<Rect>,
 }
@@ -90,6 +99,8 @@ impl AppState {
             pending: HashMap::new(),
             pending_all: None,
             last_touch: None,
+            failed_notice: None,
+            panel_hwnd: None,
             visible: false,
             tray_rect: None,
         }
@@ -324,7 +335,7 @@ fn merged_percent(preserving: bool, old: Option<&MonitorItem>, monitor: &MonSnap
 
 fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: SnapshotReason) {
     STATE.with(|cell| {
-        let state = cell.borrow();
+        let mut state = cell.borrow_mut();
         let preserving = state
             .last_touch
             .is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE);
@@ -363,15 +374,26 @@ fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: Snapshot
         win.set_scanning(false);
 
         if !preserving {
-            let status = if items.is_empty() {
-                "未检测到显示器".to_string()
-            } else if reason == SnapshotReason::Refresh {
-                format!("已发现 {} 台显示器", items.len())
+            if reason == SnapshotReason::Poll
+                && let Some(notice) = state.failed_notice.clone()
+            {
+                // Keep the failure visible until the user acts or rescans.
+                win.set_status_error(true);
+                win.set_status_text(notice.into());
             } else {
-                "亮度已同步".to_string()
-            };
-            win.set_status_error(false);
-            win.set_status_text(status.into());
+                if reason == SnapshotReason::Refresh {
+                    state.failed_notice = None;
+                }
+                let status = if items.is_empty() {
+                    "未检测到显示器".to_string()
+                } else if reason == SnapshotReason::Refresh {
+                    format!("已发现 {} 台显示器", items.len())
+                } else {
+                    "亮度已同步".to_string()
+                };
+                win.set_status_error(false);
+                win.set_status_text(status.into());
+            }
         }
 
         resize_panel(win, &state);
@@ -449,7 +471,53 @@ fn configure_popup_window(window: &slint::Window) {
         native.set_undecorated_shadow(true);
         native.focus_window();
     });
+    apply_rounded_corners(window);
+    STATE.with(|cell| {
+        cell.borrow_mut().panel_hwnd = native_hwnd(window);
+    });
 }
+
+fn native_hwnd(window: &slint::Window) -> Option<isize> {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    window
+        .with_winit_window(|native| {
+            if let Ok(handle) = native.window_handle()
+                && let RawWindowHandle::Win32(win32) = handle.as_raw()
+            {
+                Some(win32.hwnd.get())
+            } else {
+                None
+            }
+        })
+        .flatten()
+}
+
+#[cfg(windows)]
+fn apply_rounded_corners(window: &slint::Window) {
+    use slint::winit_030::winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+
+    window.with_winit_window(|native| {
+        if let Ok(handle) = native.window_handle()
+            && let RawWindowHandle::Win32(win32) = handle.as_raw()
+        {
+            // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2.
+            let preference: i32 = 2;
+            unsafe {
+                let _ = DwmSetWindowAttribute(
+                    win32.hwnd.get() as *mut core::ffi::c_void,
+                    33,
+                    &preference as *const i32 as *const core::ffi::c_void,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn apply_rounded_corners(_window: &slint::Window) {}
 
 fn configure_settings_window(window: &slint::Window) {
     window.with_winit_window(|native| {
@@ -463,7 +531,25 @@ fn refresh_settings(window: &SettingsWindow) {
     window.set_autostart_detail(autostart::detail_text().into());
 }
 
-fn enumerate_devices() -> Vec<DeviceEntry> {
+fn center_settings_window(window: &slint::Window) {
+    let (screen_w, screen_h) = primary_screen_size();
+    let size = window.size();
+    let x = (screen_w - size.width as i32) / 2;
+    let y = (screen_h - size.height as i32) / 2;
+    window.set_position(WindowPosition::Physical(PhysicalPosition::new(x, y)));
+    window.with_winit_window(|native| {
+        native.set_outer_position(WinitPhysicalPosition::new(x, y));
+    });
+}
+
+fn show_settings(window: &SettingsWindow) {
+    refresh_settings(window);
+    let _ = window.window().show();
+    configure_settings_window(window.window());
+    center_settings_window(window.window());
+}
+
+fn enumerate_devices(failed: &HashSet<String>) -> Vec<DeviceEntry> {
     let mut entries = Vec::new();
     for result in brightness_devices() {
         let index = entries.len();
@@ -483,16 +569,23 @@ fn enumerate_devices() -> Vec<DeviceEntry> {
                     "显示器".to_string()
                 };
                 let name = monitor_label(index, &label_source, is_primary_display(&device_name));
+                let blocked = failed.contains(&device_name);
                 match device.get() {
                     Ok(percent) => entries.push(DeviceEntry {
                         device: Some(device),
+                        key: device_name,
                         name,
                         percent,
-                        supported: true,
-                        detail: String::new(),
+                        supported: !blocked,
+                        detail: if blocked {
+                            "DDC/CI 写入失败，可能不支持调节".to_string()
+                        } else {
+                            String::new()
+                        },
                     }),
                     Err(_) => entries.push(DeviceEntry {
                         device: Some(device),
+                        key: device_name,
                         name,
                         percent: 0,
                         supported: false,
@@ -502,6 +595,7 @@ fn enumerate_devices() -> Vec<DeviceEntry> {
             }
             Err(_) => entries.push(DeviceEntry {
                 device: None,
+                key: String::new(),
                 name: monitor_label(index, "未知显示器", false),
                 percent: 0,
                 supported: false,
@@ -543,30 +637,79 @@ fn send_snapshot(ui: &slint::Weak<MainWindow>, devices: &[DeviceEntry], reason: 
     });
 }
 
-fn send_error(ui: &slint::Weak<MainWindow>, message: String) {
+/// `"3. RTK2775"` -> `"RTK2775"` for compact status messages.
+fn strip_index_prefix(name: &str) -> &str {
+    match name.split_once(". ") {
+        Some((prefix, rest)) if prefix.chars().all(|c| c.is_ascii_digit()) => rest,
+        _ => name,
+    }
+}
+
+/// A monitor rejected a DDC/CI write: flip it to "unsupported" instead of
+/// leaving a slider that silently fails, and tell the user in Chinese.
+fn mark_monitor_failed(win: &MainWindow, index: usize, monitor_name: &str) {
+    STATE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let Some(mut item) = state.model.row_data(index) else {
+            return;
+        };
+        item.supported = false;
+        item.detail = "DDC/CI 写入失败，可能不支持调节".into();
+        state.model.set_row_data(index, item);
+        refresh_master(win, &state);
+        win.set_scanning(false);
+        win.set_status_error(true);
+        let notice = format!(
+            "{} 无法调节（DDC/CI 写入失败）",
+            strip_index_prefix(monitor_name)
+        );
+        win.set_status_text(notice.as_str().into());
+        state.failed_notice = Some(notice);
+        resize_panel(win, &state);
+        if state.visible
+            && let Some(rect) = state.tray_rect
+        {
+            place_popup(win.window(), &rect);
+        }
+    });
+}
+
+fn send_monitor_failed(ui: &slint::Weak<MainWindow>, index: usize, monitor_name: String) {
     let weak = ui.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(win) = weak.upgrade() {
-            win.set_scanning(false);
-            win.set_status_error(true);
-            win.set_status_text(message.into());
+            mark_monitor_failed(&win, index, &monitor_name);
         }
     });
+}
+
+/// DDC/CI writes on some adapters fail intermittently, so retry once before
+/// giving up on a monitor.
+fn write_percent(device: &BrightnessDevice, percent: u32) -> Result<(), brightness::Error> {
+    device.set(percent).or_else(|_| {
+        thread::sleep(Duration::from_millis(150));
+        device.set(percent)
+    })
 }
 
 fn spawn_worker(ui: slint::Weak<MainWindow>) -> Sender<Command> {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut devices: Vec<DeviceEntry> = Vec::new();
+        // Monitors that rejected a write are remembered until the user asks for
+        // a rescan, so a slider that cannot work is not shown again.
+        let mut failed: HashSet<String> = HashSet::new();
         while let Ok(command) = receiver.recv() {
             match command {
                 Command::Refresh => {
-                    devices = enumerate_devices();
+                    // Explicit rescan gives every monitor another chance.
+                    failed.clear();
+                    devices = enumerate_devices(&failed);
                     send_snapshot(&ui, &devices, SnapshotReason::Refresh);
                 }
                 Command::Poll => {
                     if devices.is_empty() {
-                        devices = enumerate_devices();
+                        devices = enumerate_devices(&failed);
                         send_snapshot(&ui, &devices, SnapshotReason::Refresh);
                     } else {
                         poll_devices(&mut devices);
@@ -583,23 +726,50 @@ fn spawn_worker(ui: slint::Weak<MainWindow>) -> Sender<Command> {
                     let Some(device) = &entry.device else {
                         continue;
                     };
-                    match device.set(percent) {
+                    match write_percent(device, percent) {
                         Ok(()) => entry.percent = percent,
-                        Err(error) => send_error(&ui, format!("调节失败：{error}")),
+                        Err(_) => {
+                            entry.supported = false;
+                            entry.detail = "DDC/CI 写入失败，可能不支持调节".to_string();
+                            if !entry.key.is_empty() {
+                                failed.insert(entry.key.clone());
+                            }
+                            send_monitor_failed(&ui, index, entry.name.clone());
+                        }
                     }
                 }
                 Command::SetAll { percent } => {
-                    for entry in devices.iter_mut().filter(|entry| entry.supported) {
+                    // Keep going on failure so one unsupported monitor does not
+                    // block the rest.
+                    for (index, entry) in devices.iter_mut().enumerate() {
+                        if !entry.supported {
+                            continue;
+                        }
                         let Some(device) = &entry.device else {
                             continue;
                         };
-                        match device.set(percent) {
+                        match write_percent(device, percent) {
                             Ok(()) => entry.percent = percent,
-                            Err(error) => {
-                                send_error(&ui, format!("调节失败：{error}"));
-                                break;
+                            Err(_) => {
+                                entry.supported = false;
+                                entry.detail = "DDC/CI 写入失败，可能不支持调节".to_string();
+                                if !entry.key.is_empty() {
+                                    failed.insert(entry.key.clone());
+                                }
+                                send_monitor_failed(&ui, index, entry.name.clone());
                             }
                         }
+                    }
+                }
+                Command::DevFailLast => {
+                    if let Some(index) = devices.len().checked_sub(1) {
+                        let entry = &mut devices[index];
+                        entry.supported = false;
+                        entry.detail = "DDC/CI 写入失败，可能不支持调节".to_string();
+                        if !entry.key.is_empty() {
+                            failed.insert(entry.key.clone());
+                        }
+                        send_monitor_failed(&ui, index, entry.name.clone());
                     }
                 }
             }
@@ -692,6 +862,30 @@ fn already_running() -> bool {
     false
 }
 
+#[cfg(windows)]
+fn primary_screen_size() -> (i32, i32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+#[cfg(not(windows))]
+fn primary_screen_size() -> (i32, i32) {
+    (1920, 1080)
+}
+
+#[cfg(windows)]
+fn foreground_hwnd() -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow() as isize }
+}
+
+#[cfg(not(windows))]
+fn foreground_hwnd() -> isize {
+    0
+}
+
 fn main() -> Result<()> {
     if already_running() {
         return Ok(());
@@ -737,6 +931,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
+            state.failed_notice = None;
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
             queue_set(&mut state, index, percent);
@@ -755,6 +950,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
+            state.failed_notice = None;
             state.pending.remove(&index);
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
@@ -771,6 +967,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
+            state.failed_notice = None;
             for index in 0..state.model.row_count() {
                 set_row_percent(&mut state, index, percent);
             }
@@ -792,6 +989,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
+            state.failed_notice = None;
             state.pending.clear();
             state.pending_all = None;
             for index in 0..state.model.row_count() {
@@ -813,7 +1011,8 @@ fn main() -> Result<()> {
             win.set_status_text("正在扫描显示器…".into());
         }
         STATE.with(|cell| {
-            let state = cell.borrow();
+            let mut state = cell.borrow_mut();
+            state.failed_notice = None;
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::Refresh);
             }
@@ -828,9 +1027,7 @@ fn main() -> Result<()> {
         }
         STATE.with(|cell| cell.borrow_mut().visible = false);
         if let Some(window) = settings_opener.upgrade() {
-            refresh_settings(&window);
-            let _ = window.window().show();
-            configure_settings_window(window.window());
+            show_settings(&window);
         }
     });
 
@@ -872,10 +1069,14 @@ fn main() -> Result<()> {
 
     let percent_prefs = prefs.clone();
     let percent_main = main_weak.clone();
+    let percent_settings = settings_weak.clone();
     settings.on_show_percent_changed(move |enabled| {
         percent_prefs.borrow_mut().show_percent = enabled;
         percent_prefs.borrow().save();
         if let Some(window) = percent_main.upgrade() {
+            window.set_show_percent(enabled);
+        }
+        if let Some(window) = percent_settings.upgrade() {
             window.set_show_percent(enabled);
         }
     });
@@ -888,7 +1089,8 @@ fn main() -> Result<()> {
             win.set_status_text("正在扫描显示器…".into());
         }
         STATE.with(|cell| {
-            let state = cell.borrow();
+            let mut state = cell.borrow_mut();
+            state.failed_notice = None;
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::Refresh);
             }
@@ -944,9 +1146,7 @@ fn main() -> Result<()> {
                 }
                 STATE.with(|cell| cell.borrow_mut().visible = false);
                 if let Some(window) = settings.upgrade() {
-                    refresh_settings(&window);
-                    let _ = window.window().show();
-                    configure_settings_window(window.window());
+                    show_settings(&window);
                 }
             } else if event.id == ids.1 {
                 if let Some(win) = main.upgrade() {
@@ -1049,6 +1249,90 @@ fn main() -> Result<()> {
             let _ = startup.send(Command::Refresh);
         },
     );
+
+    // Dismiss the panel when the user clicks anywhere else, like a native
+    // tray flyout. The panel itself keeps foreground while it is interacted
+    // with, so a mismatch means focus moved to another window.
+    let focus_weak = main_weak.clone();
+    let focus_timer = slint::Timer::default();
+    focus_timer.start(
+        slint::TimerMode::Repeated,
+        Duration::from_millis(300),
+        move || {
+            let Some(win) = focus_weak.upgrade() else {
+                return;
+            };
+            if !win.window().is_visible() {
+                return;
+            }
+            let panel = STATE.with(|cell| cell.borrow().panel_hwnd);
+            let Some(panel) = panel else {
+                return;
+            };
+            let foreground = foreground_hwnd();
+            if foreground == 0 || foreground == panel {
+                return;
+            }
+            let _ = win.window().hide();
+            STATE.with(|cell| cell.borrow_mut().visible = false);
+        },
+    );
+
+    // Dev-only flags used for automated screenshot checks:
+    //   --dev-show      open the brightness panel above the bottom-right corner
+    //   --dev-settings  open the settings window
+    //   --dev-fail      with --dev-show, mark the last monitor as unwritable
+    let dev_show = std::env::args().any(|arg| arg == "--dev-show");
+    let dev_settings = std::env::args().any(|arg| arg == "--dev-settings");
+    let dev_fail = std::env::args().any(|arg| arg == "--dev-fail");
+    let mut _dev_timers: Vec<slint::Timer> = Vec::new();
+    if dev_show || dev_settings {
+        let panel_weak = main_weak.clone();
+        let dev_settings_weak = settings_weak.clone();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::SingleShot,
+            Duration::from_millis(900),
+            move || {
+                if dev_settings {
+                    if let Some(window) = dev_settings_weak.upgrade() {
+                        show_settings(&window);
+                    }
+                } else if let Some(win) = panel_weak.upgrade() {
+                    let (width, height) = primary_screen_size();
+                    let rect = Rect {
+                        size: tray_icon::dpi::PhysicalSize::new(24u32, 24u32),
+                        position: tray_icon::dpi::PhysicalPosition::new(
+                            f64::from(width - 40),
+                            f64::from(height - 24),
+                        ),
+                    };
+                    toggle_popup(&win.as_weak(), &rect);
+                }
+            },
+        );
+        _dev_timers.push(timer);
+
+        if dev_show && dev_fail {
+            let fail_weak = main_weak.clone();
+            let fail_timer = slint::Timer::default();
+            fail_timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(1600),
+                move || {
+                    if fail_weak.upgrade().is_some() {
+                        STATE.with(|cell| {
+                            let state = cell.borrow();
+                            if let Some(hub) = &state.hub {
+                                let _ = hub.send(Command::DevFailLast);
+                            }
+                        });
+                    }
+                },
+            );
+            _dev_timers.push(fail_timer);
+        }
+    }
 
     // Tray-only daemon: Window::run() would show() the main window first,
     // popping a visible window on launch. Our tray icon comes from the
@@ -1191,6 +1475,14 @@ mod tests {
     }
 
     #[test]
+    fn strips_monitor_index_prefix() {
+        assert_eq!(strip_index_prefix("3. RTK2775"), "RTK2775");
+        assert_eq!(strip_index_prefix("12. LEN8BA1（主）"), "LEN8BA1（主）");
+        assert_eq!(strip_index_prefix("显示器"), "显示器");
+        assert_eq!(strip_index_prefix("3.RTK2775"), "3.RTK2775");
+    }
+
+    #[test]
     fn snapshot_merging_respects_recent_user_input() {
         let old = MonitorItem {
             index: 0,
@@ -1247,7 +1539,7 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_monitors() {
-        let entries = enumerate_devices();
+        let entries = enumerate_devices(&HashSet::new());
         println!("monitors: {}", entries.len());
         for entry in &entries {
             println!(
