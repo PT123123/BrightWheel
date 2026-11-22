@@ -45,6 +45,7 @@ component PanelButton inherits Rectangle {
 // and use the mouse wheel for fine steps.
 component BrightnessSlider inherits Rectangle {
     in property <float> target: 50;
+    in property <int> reset-token: 0;
     in property <bool> enabled: true;
     callback changed(float);
     callback released(float);
@@ -65,6 +66,12 @@ component BrightnessSlider inherits Rectangle {
         if (!touch.pressed) {
             live = target;
         }
+    }
+
+    // The master slider is a relative jog: bumping the token snaps the thumb
+    // back to neutral after a drag so it never reads as an absolute value.
+    changed reset-token => {
+        live = 50;
     }
 
     rail := Rectangle {
@@ -149,6 +156,7 @@ export component MainWindow inherits Window {
     in property <bool> show-percent: true;
     in property <bool> has-master: false;
     in property <int> master-percent: 100;
+    in property <int> master-reset-token: 0;
     in property <int> supported-count: 0;
     in property <bool> scanning: false;
     in property <bool> status-error: false;
@@ -264,9 +272,9 @@ export component MainWindow inherits Window {
                         }
 
                         Text {
-                            text: root.show-percent ? root.master-percent + "%" : "";
-                            font-size: 12px;
-                            font-weight: 600;
+                            text: "左减 · 右加";
+                            font-size: 11px;
+                            font-weight: 500;
                             color: #7fb8ff;
                             vertical-alignment: center;
                         }
@@ -274,6 +282,7 @@ export component MainWindow inherits Window {
 
                     BrightnessSlider {
                         target: root.master-percent;
+                        reset-token: root.master-reset-token;
                         changed(value) => { root.master-changed(value); }
                         released(value) => { root.master-released(value); }
                     }

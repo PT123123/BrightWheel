@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,6 +35,9 @@ const MENU_SETTINGS: &str = "brightwheel.menu.settings";
 const MENU_REFRESH: &str = "brightwheel.menu.refresh";
 const MENU_QUIT: &str = "brightwheel.menu.quit";
 
+/// Bumped after each master drag so the relative slider snaps back to neutral.
+static MASTER_RESET_TOKEN: AtomicI32 = AtomicI32::new(0);
+
 // Keep these in sync with ui/app.slint.
 const PANEL_WIDTH: f32 = 372.0;
 const HEADER_H: f32 = 58.0;
@@ -41,6 +45,9 @@ const FOOTER_H: f32 = 32.0;
 const BODY_PAD: f32 = 10.0;
 const ROW_H: f32 = 58.0;
 const MASTER_H: f32 = 56.0;
+/// Neutral master-slider position: no brightness change. Left decreases,
+/// right increases; the slider snaps back here after release.
+const MASTER_NEUTRAL: i32 = 50;
 const EMPTY_H: f32 = 96.0;
 const GAP: f32 = 8.0;
 
@@ -75,7 +82,6 @@ enum Command {
     Refresh,
     Poll,
     Set { index: usize, percent: u32 },
-    SetAll { percent: u32 },
     /// Dev-only: forces the last monitor into the "unwritable" state so the
     /// failure UI can be checked without broken hardware.
     DevFailLast,
@@ -94,11 +100,10 @@ struct AppState {
     model: Rc<VecModel<MonitorItem>>,
     hub: Option<Sender<Command>>,
     pending: HashMap<usize, u32>,
-    pending_all: Option<u32>,
-    /// Absolute "all monitors" target chosen with the master slider. Unlike a
-    /// moving average, this stays put while the user drags so the slider does
-    /// not creep back toward an unrelated value.
-    master_setpoint: Option<u32>,
+    /// Master slider position from the previous frame. MASTER_NEUTRAL means
+    /// "no change"; a drag applies (current position - this value) as a
+    /// relative delta to every monitor.
+    master_last: i32,
     last_touch: Option<Instant>,
     /// Sticky Chinese message shown after a DDC/CI write failure, so the
     /// periodic poll does not immediately replace it with "亮度已同步".
@@ -115,8 +120,7 @@ impl AppState {
             model: Rc::new(VecModel::from(Vec::<MonitorItem>::new())),
             hub: None,
             pending: HashMap::new(),
-            pending_all: None,
-            master_setpoint: None,
+            master_last: MASTER_NEUTRAL,
             last_touch: None,
             failed_notice: None,
             panel_hwnd: None,
@@ -148,7 +152,7 @@ fn schedule_write() {
 }
 
 /// Write the latest queued targets. Called by the debounce timer; per-index
-/// and master targets are coalesced into a single command batch.
+/// targets are coalesced so only the final value per monitor is written.
 fn flush_writes() {
     STATE.with(|cell| {
         let mut state = cell.borrow_mut();
@@ -160,9 +164,6 @@ fn flush_writes() {
             for (index, percent) in pending {
                 let _ = hub.send(Command::Set { index, percent });
             }
-        }
-        if let Some(percent) = state.pending_all.take() {
-            let _ = hub.send(Command::SetAll { percent });
         }
     });
 }
@@ -429,12 +430,10 @@ fn set_row_percent(state: &mut AppState, index: usize, percent: u32) {
     }
 }
 
-/// The master slider shows the absolute target the user chose while one is
-/// active, and only falls back to the measured average otherwise.
-fn displayed_master(state: &AppState, average: u32) -> u32 {
-    state.master_setpoint.unwrap_or(average)
-}
-
+/// The master slider is a relative control: it always rests at MASTER_NEUTRAL
+/// and only moves while the user drags, so it never displays an absolute
+/// brightness that a poll would fight over. The tray icon still reflects the
+/// true measured average.
 fn refresh_master(win: &MainWindow, state: &AppState) {
     let supported: Vec<u32> = (0..state.model.row_count())
         .filter_map(|index| state.model.row_data(index))
@@ -444,10 +443,32 @@ fn refresh_master(win: &MainWindow, state: &AppState) {
     win.set_supported_count(supported.len() as i32);
     win.set_has_master(supported.len() > 1);
     if let Some(average) = average_percent(&supported) {
-        let shown = displayed_master(state, average);
-        win.set_master_percent(shown as i32);
-        paint_tray(shown);
+        paint_tray(average);
     }
+}
+
+/// Signed relative change of the master slider from neutral, e.g. `+12` / `-8`.
+fn master_delta(position: f32) -> i32 {
+    (position.round() as i32) - MASTER_NEUTRAL
+}
+
+/// Apply a signed relative delta to every supported monitor, clamped to 0..100.
+/// Returns the per-monitor absolute targets for the caller to queue/write.
+fn relative_targets(state: &AppState, delta: i32) -> Vec<(usize, u32)> {
+    if delta == 0 {
+        return Vec::new();
+    }
+    let mut targets = Vec::new();
+    for index in 0..state.model.row_count() {
+        if let Some(item) = state.model.row_data(index)
+            && item.supported
+        {
+            let current = item.percent.max(0);
+            let next = (current + delta).clamp(0, 100) as u32;
+            targets.push((index, next));
+        }
+    }
+    targets
 }
 
 fn merged_percent(preserving: bool, old: Option<&MonitorItem>, monitor: &MonSnapshot) -> i32 {
@@ -463,10 +484,10 @@ fn merged_percent(preserving: bool, old: Option<&MonitorItem>, monitor: &MonSnap
 fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: SnapshotReason) {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
-            // An explicit rescan re-reads reality: drop any absolute master
-            // target so the slider falls back to the measured average.
+            // An explicit rescan re-reads reality; make sure the next relative
+            // drag starts from neutral.
             if reason == SnapshotReason::Refresh {
-                state.master_setpoint = None;
+                state.master_last = MASTER_NEUTRAL;
             }
             let preserving = state
                 .last_touch
@@ -499,10 +520,10 @@ fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: Snapshot
             .collect();
         win.set_supported_count(supported.len() as i32);
         win.set_has_master(supported.len() > 1);
-        if let Some(average) = average_percent(&supported) {
-            let shown = displayed_master(&state, average);
-            win.set_master_percent(shown as i32);
-            paint_tray(shown);
+        // The master slider is relative: keep it parked at neutral so a poll
+        // never yanks the thumb; the tray keeps showing the true average.
+        if average_percent(&supported).is_some() {
+            win.set_master_percent(MASTER_NEUTRAL);
         }
         win.set_scanning(false);
 
@@ -871,29 +892,6 @@ fn spawn_worker(ui: slint::Weak<MainWindow>) -> Sender<Command> {
                         }
                     }
                 }
-                Command::SetAll { percent } => {
-                    // Keep going on failure so one unsupported monitor does not
-                    // block the rest.
-                    for (index, entry) in devices.iter_mut().enumerate() {
-                        if !entry.supported {
-                            continue;
-                        }
-                        let Some(device) = &entry.device else {
-                            continue;
-                        };
-                        match write_percent(device, percent) {
-                            Ok(()) => entry.percent = percent,
-                            Err(_) => {
-                                entry.supported = false;
-                                entry.detail = "DDC/CI 写入失败，可能不支持调节".to_string();
-                                if !entry.key.is_empty() {
-                                    failed.insert(entry.key.clone());
-                                }
-                                send_monitor_failed(&ui, index, entry.name.clone());
-                            }
-                        }
-                    }
-                }
                 Command::DevFailLast => {
                     if let Some(index) = devices.len().checked_sub(1) {
                         let entry = &mut devices[index];
@@ -1041,9 +1039,6 @@ fn main() -> Result<()> {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
-            // A direct single-monitor drag overrides any master target: from
-            // now on the master reflects the real average again.
-            state.master_setpoint = None;
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
             queue_set(&mut state, index, percent);
@@ -1064,7 +1059,6 @@ fn main() -> Result<()> {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
-            state.master_setpoint = None;
             state.pending.remove(&index);
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
@@ -1079,23 +1073,37 @@ fn main() -> Result<()> {
         let Some(win) = master_weak.upgrade() else {
             return;
         };
-        let percent = clamp_percent(value);
+        // Relative control: the delta is this position minus the previous
+        // frame's position, so drag speed/distance maps to a brightness change
+        // rather than an absolute target. Neutral (50) means "no change".
+        let delta = master_delta(value);
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
-            // Absolute target: every monitor goes to exactly this percent.
-            state.master_setpoint = Some(percent);
-            for index in 0..state.model.row_count() {
-                set_row_percent(&mut state, index, percent);
+            let step = delta - (state.master_last - MASTER_NEUTRAL);
+            state.master_last = delta + MASTER_NEUTRAL;
+            if step == 0 {
+                return;
             }
-            state.pending.clear();
-            state.pending_all = Some(percent);
-            win.set_master_percent(percent as i32);
-            paint_tray(percent);
+            let targets = relative_targets(&state, step);
+            for (index, percent) in targets {
+                set_row_percent(&mut state, index, percent);
+                queue_set(&mut state, index, percent);
+            }
+            let supported: Vec<u32> = (0..state.model.row_count())
+                .filter_map(|index| state.model.row_data(index))
+                .filter(|item| item.supported)
+                .map(|item| item.percent.max(0) as u32)
+                .collect();
+            if let Some(average) = average_percent(&supported) {
+                paint_tray(average);
+            }
             schedule_write();
             win.set_status_error(false);
-            win.set_status_text(format!("所有显示器：{percent}%").into());
+            let sign = if step > 0 { "+" } else { "" };
+            let anchor = format!("所有显示器：{sign}{step}%");
+            win.set_status_text(anchor.into());
         });
     });
 
@@ -1104,25 +1112,30 @@ fn main() -> Result<()> {
         let Some(win) = master_released_weak.upgrade() else {
             return;
         };
-        let percent = clamp_percent(value);
+        // Accumulate any final movement since the last changed event, then
+        // snap the thumb back to neutral: the master is not an absolute value.
+        let delta = master_delta(value);
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
-            state.master_setpoint = Some(percent);
-            state.pending.clear();
-            state.pending_all = None;
-            for index in 0..state.model.row_count() {
-                set_row_percent(&mut state, index, percent);
-            }
-            win.set_master_percent(percent as i32);
-            paint_tray(percent);
-            // Commit the final absolute target immediately; the debounced
-            // pending_all was cleared, so no duplicate write follows.
-            if let Some(hub) = &state.hub {
-                let _ = hub.send(Command::SetAll { percent });
+            let step = delta - (state.master_last - MASTER_NEUTRAL);
+            state.master_last = MASTER_NEUTRAL;
+            if step != 0 {
+                let targets = relative_targets(&state, step);
+                for (index, _) in &targets {
+                    state.pending.remove(index);
+                }
+                for (index, percent) in targets {
+                    set_row_percent(&mut state, index, percent);
+                    send_now(&state, index, percent);
+                }
             }
         });
+        // Park the slider at neutral regardless of where it was released.
+        win.set_master_percent(MASTER_NEUTRAL);
+        MASTER_RESET_TOKEN.fetch_add(1, Ordering::Relaxed);
+        win.set_master_reset_token(MASTER_RESET_TOKEN.load(Ordering::Relaxed));
     });
 
     let refresh_weak = main_weak.clone();
@@ -1135,7 +1148,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.failed_notice = None;
-            state.master_setpoint = None;
+            state.master_last = MASTER_NEUTRAL;
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::Refresh);
             }
@@ -1214,7 +1227,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.failed_notice = None;
-            state.master_setpoint = None;
+            state.master_last = MASTER_NEUTRAL;
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::Refresh);
             }
@@ -1340,7 +1353,7 @@ fn main() -> Result<()> {
                 {
                     return;
                 }
-                if !state.pending.is_empty() || state.pending_all.is_some() {
+                if !state.pending.is_empty() {
                     return;
                 }
                 if let Some(hub) = &state.hub {
@@ -1481,15 +1494,30 @@ mod tests {
     }
 
     #[test]
-    fn master_slider_prefers_absolute_target() {
-        let mut state = AppState::new();
-        assert_eq!(displayed_master(&state, 47), 47);
-        state.master_setpoint = Some(80);
-        // The measured average must not pull an absolute master target back.
-        assert_eq!(displayed_master(&state, 47), 80);
-        assert_eq!(displayed_master(&state, 100), 80);
-        state.master_setpoint = None;
-        assert_eq!(displayed_master(&state, 55), 55);
+    fn master_slider_is_relative_around_neutral() {
+        // Center is "no change"; moving right adds, moving left subtracts.
+        assert_eq!(master_delta(50.0), 0);
+        assert_eq!(master_delta(63.0), 13);
+        assert_eq!(master_delta(37.0), -13);
+        assert_eq!(master_delta(100.0), 50);
+        assert_eq!(master_delta(0.0), -50);
+    }
+
+    #[test]
+    fn relative_targets_shift_all_monitors_by_delta() {
+        let state = AppState::new();
+        let model = Rc::new(VecModel::from(vec![
+            MonitorItem { index: 0, name: "a".into(), percent: 30, supported: true, detail: "".into() },
+            MonitorItem { index: 1, name: "b".into(), percent: 60, supported: true, detail: "".into() },
+            MonitorItem { index: 2, name: "c".into(), percent: 40, supported: false, detail: "".into() },
+        ]));
+        let state = AppState { model: model.clone(), ..state };
+        let targets = relative_targets(&state, 10);
+        // Supported monitors shift by +10; unsupported one is skipped; clamp at 100.
+        assert_eq!(targets, vec![(0, 40), (1, 70)]);
+        let down = relative_targets(&state, -35);
+        assert_eq!(down, vec![(0, 0), (1, 25)]);
+        assert!(relative_targets(&state, 0).is_empty());
     }
 
     #[test]
