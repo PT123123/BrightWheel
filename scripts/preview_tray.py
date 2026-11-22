@@ -11,7 +11,8 @@ import zlib
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tray_preview.png")
 SUN = (255, 205, 72)
 SUN_LO = (232, 150, 46)
-TRACK = (74, 78, 88)
+# No dark track ring: an unfilled grey circle reads as a black frame.
+TRACK = (0, 0, 0)
 
 
 def icon_pixels(n, percent):
@@ -57,7 +58,9 @@ def icon_pixels(n, percent):
             # progress ring
             if abs(d - ring_r * scale) <= ring_hw * scale:
                 deg = (math.degrees(math.atan2(dy, dx)) + 90.0 + 360.0) % 360.0
-                grid[yy][xx] = (sun if deg <= sweep else TRACK) + (255,)
+                if deg <= sweep:
+                    grid[yy][xx] = sun + (255,)
+                # else: leave transparent (no dark frame around the icon)
 
     out = []
     for y in range(n):

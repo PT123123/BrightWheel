@@ -235,7 +235,6 @@ const ICON_SS: usize = 4;
 
 const ICON_SUN: (f32, f32, f32) = (255.0, 205.0, 72.0);
 const ICON_SUN_LO: (f32, f32, f32) = (232.0, 150.0, 46.0);
-const ICON_TRACK: (u8, u8, u8) = (74, 78, 88);
 
 /// Sun tint: warmer/dimmer at 0%, bright golden at 100%.
 fn icon_color(percent: u32) -> (u8, u8, u8) {
@@ -293,13 +292,13 @@ fn icon_rgba(percent: u32) -> Vec<u8> {
                 if ray_hit {
                     px = [sun.0, sun.1, sun.2, 255];
                 } else if (dist - ring_r).abs() <= ring_hw {
+                    // Only the filled arc is drawn. No dark track underneath:
+                    // a grey ring reads as a black frame around the icon at
+                    // tray sizes, so the unfilled part stays transparent.
                     let deg = (dy.atan2(dx).to_degrees() + 90.0 + 360.0) % 360.0;
-                    let c = if deg <= sweep {
-                        sun
-                    } else {
-                        ICON_TRACK
-                    };
-                    px = [c.0, c.1, c.2, 255];
+                    if deg <= sweep {
+                        px = [sun.0, sun.1, sun.2, 255];
+                    }
                 }
             }
             grid[yy * grid_n + xx] = px;
@@ -1532,16 +1531,14 @@ mod tests {
 
     #[test]
     fn tray_icon_progress_ring_grows_with_brightness() {
-        // Sample the 12-o'clock ring pixel just past the start: at 0% it is
-        // track-colored, at high brightness it turns sun-colored.
+        // Sample the 12-o'clock ring pixel just past the start: at 0% the
+        // unfilled arc is transparent (no dark frame), at 100% it is golden.
         let sample = (2 * ICON_N + ICON_N / 2) * 4;
         let lo = icon_rgba(0);
         let hi = icon_rgba(100);
-        assert_eq!(
-            &lo[sample..sample + 3],
-            &[ICON_TRACK.0, ICON_TRACK.1, ICON_TRACK.2]
-        );
+        assert_eq!(lo[sample + 3], 0, "unfilled arc must be transparent");
         assert_eq!(&hi[sample..sample + 3], &[255, 205, 72]);
+        assert_eq!(hi[sample + 3], 255);
     }
 
     #[test]

@@ -10,7 +10,6 @@ import zlib
 
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "app.ico")
 SUN = (255, 205, 72)
-TRACK = (74, 78, 88)
 
 
 def pixels(size):
