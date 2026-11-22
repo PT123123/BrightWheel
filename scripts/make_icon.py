@@ -1,29 +1,52 @@
-"""Generate assets/app.ico: a yellow sun/brightness glyph, no external deps."""
+"""Generate assets/app.ico: a sun inside a full brightness ring.
+
+Pure stdlib. Uses 4x supersampling, matching scripts/preview_tray.py and the
+Rust tray icon in src/main.rs so the exe icon and tray icon share one design.
+"""
 import math
 import os
 import struct
 import zlib
 
 OUT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "app.ico")
-COLOR = (255, 205, 70)
+SUN = (255, 205, 72)
+TRACK = (74, 78, 88)
 
 
 def pixels(size):
-    scale = 3
+    scale = 4
     n = size * scale
-    cx = cy = (n - 1) / 2.0
-    core_r = n * 0.185
-    ray_in, ray_out = n * 0.29, n * 0.45
-    grid = [[COLOR + (0,) for _ in range(n)] for _ in range(n)]
-    for y in range(n):
-        for x in range(n):
-            dx, dy = x - cx, y - cy
+    center = (n - 1) / 2.0 + 0.5
+    core_r = size * 0.175 * scale
+    ray_in, ray_out = size * 0.205 * scale, size * 0.335 * scale
+    ring_r = size * 0.415 * scale
+    ring_hw = max(0.9, size * 0.035) * scale
+
+    grid = [[(0, 0, 0, 0) for _ in range(n)] for _ in range(n)]
+    for yy in range(n):
+        for xx in range(n):
+            dx = xx + 0.5 - center
+            dy = yy + 0.5 - center
             d = math.hypot(dx, dy)
-            angle = math.atan2(dy, dx)
-            core = d <= core_r
-            ray = ray_in <= d <= ray_out and abs(math.cos(angle * 4.0)) > 0.93
-            if core or ray:
-                grid[y][x] = COLOR + (255,)
+            if d <= core_r:
+                grid[yy][xx] = SUN + (255,)
+                continue
+            hit = False
+            for k in range(8):
+                a = k * math.pi / 4
+                ux, uy = math.cos(a), math.sin(a)
+                proj = dx * ux + dy * uy
+                perp = -dx * uy + dy * ux
+                if ray_in <= proj <= ray_out:
+                    q = (proj - ray_in) / (ray_out - ray_in)
+                    if abs(perp) <= (1.9 - 1.15 * q) * scale:
+                        hit = True
+                        break
+            if hit:
+                grid[yy][xx] = SUN + (255,)
+            elif abs(d - ring_r) <= ring_hw:
+                grid[yy][xx] = SUN + (255,)  # full ring for the static app icon
+
     result = []
     for y in range(size):
         row = []

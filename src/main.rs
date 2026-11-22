@@ -230,37 +230,106 @@ fn monitor_label(index: usize, friendly: &str, primary: bool) -> String {
     format!("{}. {}{}", index + 1, name, suffix)
 }
 
+const ICON_N: usize = 32;
+const ICON_SS: usize = 4;
+
+const ICON_SUN: (f32, f32, f32) = (255.0, 205.0, 72.0);
+const ICON_SUN_LO: (f32, f32, f32) = (232.0, 150.0, 46.0);
+const ICON_TRACK: (u8, u8, u8) = (74, 78, 88);
+
+/// Sun tint: warmer/dimmer at 0%, bright golden at 100%.
 fn icon_color(percent: u32) -> (u8, u8, u8) {
     let t = percent.min(100) as f32 / 100.0;
+    let mix = |lo: f32, hi: f32| (lo + (hi - lo) * t) as u8;
     (
-        (205.0 + 50.0 * t) as u8,
-        (150.0 + 55.0 * t) as u8,
-        (60.0 - 40.0 * t) as u8,
+        mix(ICON_SUN_LO.0, ICON_SUN.0),
+        mix(ICON_SUN_LO.1, ICON_SUN.1),
+        mix(ICON_SUN_LO.2, ICON_SUN.2),
     )
 }
 
-fn make_icon(percent: u32) -> Icon {
-    const N: usize = 32;
-    let mut rgba = vec![0u8; N * N * 4];
-    let (r, g, b) = icon_color(percent);
+/// A sun (solid core + 8 tapered rays) wrapped in a clockwise progress ring
+/// that starts at 12 o'clock. Rendered at 4x then box-filtered for smooth
+/// edges at tray sizes. Returns ICON_N*ICON_N*4 RGBA bytes.
+fn icon_rgba(percent: u32) -> Vec<u8> {
+    let n = ICON_N as f32;
+    let ss = ICON_SS as f32;
+    let grid_n = ICON_N * ICON_SS;
+    let center = ((n - 1.0) / 2.0 + 0.5) * ss;
+    let core_r = n * 0.175 * ss;
+    let ray_in = n * 0.205 * ss;
+    let ray_out = n * 0.335 * ss;
+    let ring_r = n * 0.415 * ss;
+    let ring_hw = (0.9f32).max(n * 0.035) * ss;
+    let sun = icon_color(percent);
+    let sweep = percent.min(100) as f32 * 3.6;
 
-    for y in 0..N {
-        for x in 0..N {
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let angle = dy.atan2(dx);
-            let ray = distance > 9.0 && distance < 14.0 && (angle * 4.0).cos().abs() > 0.96;
-            if distance <= 6.5 || ray {
-                let i = (y * N + x) * 4;
-                rgba[i] = r;
-                rgba[i + 1] = g;
-                rgba[i + 2] = b;
-                rgba[i + 3] = 255;
+    let mut grid = vec![[0u8; 4]; grid_n * grid_n];
+    for yy in 0..grid_n {
+        for xx in 0..grid_n {
+            let dx = xx as f32 + 0.5 - center;
+            let dy = yy as f32 + 0.5 - center;
+            let dist = dx.hypot(dy);
+            let mut px = [0u8; 4];
+
+            if dist <= core_r {
+                px = [sun.0, sun.1, sun.2, 255];
+            } else {
+                let mut ray_hit = false;
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::PI / 4.0;
+                    let ux = a.cos();
+                    let uy = a.sin();
+                    let proj = dx * ux + dy * uy;
+                    let perp = -dx * uy + dy * ux;
+                    if proj >= ray_in && proj <= ray_out {
+                        let q = (proj - ray_in) / (ray_out - ray_in);
+                        if perp.abs() <= (1.9 - 1.15 * q) * ss {
+                            ray_hit = true;
+                            break;
+                        }
+                    }
+                }
+                if ray_hit {
+                    px = [sun.0, sun.1, sun.2, 255];
+                } else if (dist - ring_r).abs() <= ring_hw {
+                    let deg = (dy.atan2(dx).to_degrees() + 90.0 + 360.0) % 360.0;
+                    let c = if deg <= sweep {
+                        sun
+                    } else {
+                        ICON_TRACK
+                    };
+                    px = [c.0, c.1, c.2, 255];
+                }
+            }
+            grid[yy * grid_n + xx] = px;
+        }
+    }
+
+    let mut rgba = vec![0u8; ICON_N * ICON_N * 4];
+    let ss2 = (ICON_SS * ICON_SS) as u32;
+    for y in 0..ICON_N {
+        for x in 0..ICON_N {
+            let mut acc = [0u32; 4];
+            for sy in 0..ICON_SS {
+                for sx in 0..ICON_SS {
+                    let p = grid[(y * ICON_SS + sy) * grid_n + x * ICON_SS + sx];
+                    for i in 0..4 {
+                        acc[i] += p[i] as u32;
+                    }
+                }
+            }
+            let i = (y * ICON_N + x) * 4;
+            for c in 0..4 {
+                rgba[i + c] = (acc[c] / ss2) as u8;
             }
         }
     }
-    Icon::from_rgba(rgba, N as u32, N as u32).expect("invalid tray icon")
+    rgba
+}
+
+fn make_icon(percent: u32) -> Icon {
+    Icon::from_rgba(icon_rgba(percent), ICON_N as u32, ICON_N as u32).expect("invalid tray icon")
 }
 
 fn paint_tray(percent: u32) {
@@ -1445,9 +1514,34 @@ mod tests {
 
     #[test]
     fn icon_color_tracks_brightness() {
-        assert_eq!(icon_color(0), (205, 150, 60));
-        assert_eq!(icon_color(100), (255, 205, 20));
-        assert_eq!(icon_color(250), (255, 205, 20));
+        assert_eq!(icon_color(0), (232, 150, 46));
+        assert_eq!(icon_color(100), (255, 205, 72));
+        assert_eq!(icon_color(250), (255, 205, 72));
+    }
+
+    #[test]
+    fn tray_icon_has_expected_size_and_transparent_background() {
+        let a = icon_rgba(50);
+        assert_eq!(a.len(), ICON_N * ICON_N * 4);
+        // Corner is fully transparent.
+        assert_eq!(a[3], 0);
+        // Center is the solid sun core.
+        let center = ((ICON_N / 2) * ICON_N + ICON_N / 2) * 4;
+        assert_eq!(a[center + 3], 255);
+    }
+
+    #[test]
+    fn tray_icon_progress_ring_grows_with_brightness() {
+        // Sample the 12-o'clock ring pixel just past the start: at 0% it is
+        // track-colored, at high brightness it turns sun-colored.
+        let sample = (2 * ICON_N + ICON_N / 2) * 4;
+        let lo = icon_rgba(0);
+        let hi = icon_rgba(100);
+        assert_eq!(
+            &lo[sample..sample + 3],
+            &[ICON_TRACK.0, ICON_TRACK.1, ICON_TRACK.2]
+        );
+        assert_eq!(&hi[sample..sample + 3], &[255, 205, 72]);
     }
 
     #[test]
