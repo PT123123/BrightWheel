@@ -21,7 +21,10 @@ use brightness::blocking::{Brightness, BrightnessDevice, brightness_devices};
 use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::WinitWindowAccessor;
-use slint::{LogicalSize, Model, ModelRc, PhysicalPosition, VecModel, WindowPosition, WindowSize};
+use slint::{
+    LogicalSize, Model, ModelRc, PhysicalPosition, Timer, TimerMode, VecModel, WindowPosition,
+    WindowSize,
+};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{
     Icon, MouseButton, MouseButtonState, Rect, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -47,6 +50,12 @@ const SCREEN_MARGIN: i32 = 12;
 /// How long after a user drag we keep local values instead of overwriting them
 /// with a polled snapshot.
 const INTERACTION_GRACE: Duration = Duration::from_millis(1500);
+
+/// Trailing-edge debounce for DDC/CI writes. While the user is dragging, only
+/// the UI updates; the final value is written once the slider has been still
+/// for this long (or immediately on release). Fast drags therefore cannot
+/// queue a long tail of stale brightness commands into the worker.
+const WRITE_DEBOUNCE: Duration = Duration::from_millis(110);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MonSnapshot {
@@ -86,6 +95,10 @@ struct AppState {
     hub: Option<Sender<Command>>,
     pending: HashMap<usize, u32>,
     pending_all: Option<u32>,
+    /// Absolute "all monitors" target chosen with the master slider. Unlike a
+    /// moving average, this stays put while the user drags so the slider does
+    /// not creep back toward an unrelated value.
+    master_setpoint: Option<u32>,
     last_touch: Option<Instant>,
     /// Sticky Chinese message shown after a DDC/CI write failure, so the
     /// periodic poll does not immediately replace it with "亮度已同步".
@@ -103,6 +116,7 @@ impl AppState {
             hub: None,
             pending: HashMap::new(),
             pending_all: None,
+            master_setpoint: None,
             last_touch: None,
             failed_notice: None,
             panel_hwnd: None,
@@ -118,6 +132,39 @@ thread_local! {
     static MENU_ITEMS: RefCell<Vec<MenuItem>> = const { RefCell::new(Vec::new()) };
     static LAST_TRAY_PERCENT: RefCell<Option<u32>> = const { RefCell::new(None) };
     static STATE: RefCell<AppState> = RefCell::new(AppState::new());
+    // Single-shot write timer: restarts on every slider move so only the
+    // final value is written once the user stops dragging.
+    static WRITE_TIMER: RefCell<Option<Timer>> = const { RefCell::new(None) };
+}
+
+/// Arm (or re-arm) the trailing-edge debounce. Rapid slider moves keep
+/// pushing the write out, so the worker never accumulates a stale queue.
+fn schedule_write() {
+    WRITE_TIMER.with(|cell| {
+        if let Some(timer) = cell.borrow().as_ref() {
+            timer.restart();
+        }
+    });
+}
+
+/// Write the latest queued targets. Called by the debounce timer; per-index
+/// and master targets are coalesced into a single command batch.
+fn flush_writes() {
+    STATE.with(|cell| {
+        let mut state = cell.borrow_mut();
+        let Some(hub) = state.hub.clone() else {
+            return;
+        };
+        if !state.pending.is_empty() {
+            let pending: Vec<(usize, u32)> = state.pending.drain().collect();
+            for (index, percent) in pending {
+                let _ = hub.send(Command::Set { index, percent });
+            }
+        }
+        if let Some(percent) = state.pending_all.take() {
+            let _ = hub.send(Command::SetAll { percent });
+        }
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -382,6 +429,12 @@ fn set_row_percent(state: &mut AppState, index: usize, percent: u32) {
     }
 }
 
+/// The master slider shows the absolute target the user chose while one is
+/// active, and only falls back to the measured average otherwise.
+fn displayed_master(state: &AppState, average: u32) -> u32 {
+    state.master_setpoint.unwrap_or(average)
+}
+
 fn refresh_master(win: &MainWindow, state: &AppState) {
     let supported: Vec<u32> = (0..state.model.row_count())
         .filter_map(|index| state.model.row_data(index))
@@ -391,8 +444,9 @@ fn refresh_master(win: &MainWindow, state: &AppState) {
     win.set_supported_count(supported.len() as i32);
     win.set_has_master(supported.len() > 1);
     if let Some(average) = average_percent(&supported) {
-        win.set_master_percent(average as i32);
-        paint_tray(average);
+        let shown = displayed_master(state, average);
+        win.set_master_percent(shown as i32);
+        paint_tray(shown);
     }
 }
 
@@ -407,11 +461,16 @@ fn merged_percent(preserving: bool, old: Option<&MonitorItem>, monitor: &MonSnap
 }
 
 fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: SnapshotReason) {
-    STATE.with(|cell| {
-        let mut state = cell.borrow_mut();
-        let preserving = state
-            .last_touch
-            .is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE);
+        STATE.with(|cell| {
+            let mut state = cell.borrow_mut();
+            // An explicit rescan re-reads reality: drop any absolute master
+            // target so the slider falls back to the measured average.
+            if reason == SnapshotReason::Refresh {
+                state.master_setpoint = None;
+            }
+            let preserving = state
+                .last_touch
+                .is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE);
 
         let mut items = Vec::with_capacity(snapshot.len());
         for (index, monitor) in snapshot.iter().enumerate() {
@@ -441,8 +500,9 @@ fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: Snapshot
         win.set_supported_count(supported.len() as i32);
         win.set_has_master(supported.len() > 1);
         if let Some(average) = average_percent(&supported) {
-            win.set_master_percent(average as i32);
-            paint_tray(average);
+            let shown = displayed_master(&state, average);
+            win.set_master_percent(shown as i32);
+            paint_tray(shown);
         }
         win.set_scanning(false);
 
@@ -981,9 +1041,13 @@ fn main() -> Result<()> {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
+            // A direct single-monitor drag overrides any master target: from
+            // now on the master reflects the real average again.
+            state.master_setpoint = None;
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
             queue_set(&mut state, index, percent);
+            schedule_write();
             win.set_status_error(false);
             win.set_status_text(format!("显示器 {}：{}%", index + 1, percent).into());
         });
@@ -1000,9 +1064,12 @@ fn main() -> Result<()> {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
+            state.master_setpoint = None;
             state.pending.remove(&index);
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
+            // Commit the final value now; the pending debounce write for this
+            // index was just removed so no duplicate/stale write follows.
             send_now(&state, index, percent);
         });
     });
@@ -1017,6 +1084,8 @@ fn main() -> Result<()> {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
+            // Absolute target: every monitor goes to exactly this percent.
+            state.master_setpoint = Some(percent);
             for index in 0..state.model.row_count() {
                 set_row_percent(&mut state, index, percent);
             }
@@ -1024,6 +1093,7 @@ fn main() -> Result<()> {
             state.pending_all = Some(percent);
             win.set_master_percent(percent as i32);
             paint_tray(percent);
+            schedule_write();
             win.set_status_error(false);
             win.set_status_text(format!("所有显示器：{percent}%").into());
         });
@@ -1039,6 +1109,7 @@ fn main() -> Result<()> {
             let mut state = cell.borrow_mut();
             state.last_touch = Some(Instant::now());
             state.failed_notice = None;
+            state.master_setpoint = Some(percent);
             state.pending.clear();
             state.pending_all = None;
             for index in 0..state.model.row_count() {
@@ -1046,6 +1117,8 @@ fn main() -> Result<()> {
             }
             win.set_master_percent(percent as i32);
             paint_tray(percent);
+            // Commit the final absolute target immediately; the debounced
+            // pending_all was cleared, so no duplicate write follows.
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::SetAll { percent });
             }
@@ -1062,6 +1135,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.failed_notice = None;
+            state.master_setpoint = None;
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::Refresh);
             }
@@ -1140,6 +1214,7 @@ fn main() -> Result<()> {
         STATE.with(|cell| {
             let mut state = cell.borrow_mut();
             state.failed_notice = None;
+            state.master_setpoint = None;
             if let Some(hub) = &state.hub {
                 let _ = hub.send(Command::Refresh);
             }
@@ -1237,29 +1312,15 @@ fn main() -> Result<()> {
 
     // --- Timers ----------------------------------------------------------
 
-    // Coalesce rapid slider updates so DDC/CI writes never queue up.
-    let flush_timer = slint::Timer::default();
-    flush_timer.start(
-        slint::TimerMode::Repeated,
-        Duration::from_millis(60),
-        move || {
-            STATE.with(|cell| {
-                let mut state = cell.borrow_mut();
-                let Some(hub) = state.hub.clone() else {
-                    return;
-                };
-                if !state.pending.is_empty() {
-                    let pending: Vec<(usize, u32)> = state.pending.drain().collect();
-                    for (index, percent) in pending {
-                        let _ = hub.send(Command::Set { index, percent });
-                    }
-                }
-                if let Some(percent) = state.pending_all.take() {
-                    let _ = hub.send(Command::SetAll { percent });
-                }
-            });
-        },
-    );
+    // Trailing-edge debounce: each slider move restarts this single-shot
+    // timer, so a fast drag writes only the final value. DDC/CI is slow and
+    // serial; a periodic flush would queue stale values that keep changing
+    // the screen long after the drag ended.
+    WRITE_TIMER.with(|cell| {
+        let timer = Timer::default();
+        timer.start(TimerMode::SingleShot, WRITE_DEBOUNCE, flush_writes);
+        *cell.borrow_mut() = Some(timer);
+    });
 
     // While the panel is open, keep values in sync with external changes
     // (keyboard brightness keys, other apps, monitor OSD).
@@ -1417,6 +1478,26 @@ mod tests {
         assert_eq!(clamp_percent(180.0), 100);
         assert_eq!(clamp_percent(f32::NAN), 0);
         assert_eq!(clamp_percent(f32::INFINITY), 0);
+    }
+
+    #[test]
+    fn master_slider_prefers_absolute_target() {
+        let mut state = AppState::new();
+        assert_eq!(displayed_master(&state, 47), 47);
+        state.master_setpoint = Some(80);
+        // The measured average must not pull an absolute master target back.
+        assert_eq!(displayed_master(&state, 47), 80);
+        assert_eq!(displayed_master(&state, 100), 80);
+        state.master_setpoint = None;
+        assert_eq!(displayed_master(&state, 55), 55);
+    }
+
+    #[test]
+    fn write_debounce_is_shorter_than_poll_and_interaction_grace() {
+        // Long enough to swallow a fast drag, short enough to feel instant.
+        assert!(WRITE_DEBOUNCE >= Duration::from_millis(80));
+        assert!(WRITE_DEBOUNCE <= Duration::from_millis(200));
+        assert!(WRITE_DEBOUNCE < INTERACTION_GRACE);
     }
 
     #[test]
