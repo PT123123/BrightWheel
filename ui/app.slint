@@ -21,6 +21,10 @@ component PanelButton inherits Rectangle {
     animate background { duration: 110ms; }
 
     Text {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         text: root.label;
         color: #f5f5f7;
         font-size: 12px;
@@ -30,6 +34,10 @@ component PanelButton inherits Rectangle {
     }
 
     touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
@@ -88,6 +96,10 @@ component BrightnessSlider inherits Rectangle {
     }
 
     touch := TouchArea {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         enabled: root.enabled;
         mouse-cursor: pointer;
 
@@ -137,6 +149,7 @@ export component MainWindow inherits Window {
     in property <int> master-percent: 100;
     in property <int> supported-count: 0;
     in property <bool> scanning: false;
+    in property <bool> status-error: false;
 
     callback brightness-changed(int, float);
     callback brightness-released(int, float);
@@ -166,6 +179,10 @@ export component MainWindow inherits Window {
     }
 
     VerticalLayout {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
         spacing: 0px;
 
         Rectangle {
@@ -322,14 +339,14 @@ export component MainWindow inherits Window {
                     spacing: 6px;
 
                     Text {
-                        text: "未检测到显示器";
+                        text: root.scanning ? "正在扫描显示器…" : "未检测到显示器";
                         font-size: 13px;
                         color: #d0d0d6;
                         horizontal-alignment: center;
                     }
 
                     Text {
-                        text: "点击「刷新」重新扫描，或检查显示器连接";
+                        text: root.scanning ? "首次扫描可能需要几秒" : "点击「刷新」重新扫描，或检查显示器连接";
                         font-size: 10px;
                         color: #7c7c83;
                         horizontal-alignment: center;
@@ -350,10 +367,17 @@ export component MainWindow inherits Window {
                 Text {
                     text: root.status-text;
                     font-size: 10px;
-                    color: #7c7c83;
+                    color: root.status-error ? #ffb340 : #7c7c83;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                     overflow: elide;
+                }
+
+                PanelButton {
+                    label: "收起";
+                    width: 46px;
+                    height: 24px;
+                    clicked => { root.request-hide(); }
                 }
 
                 PanelButton {

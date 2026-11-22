@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use brightness::blocking::windows::BrightnessExt;
 use brightness::blocking::{Brightness, BrightnessDevice, brightness_devices};
 use slint::winit_030::winit::dpi::PhysicalPosition as WinitPhysicalPosition;
 use slint::winit_030::winit::platform::windows::WindowExtWindows;
@@ -203,6 +204,14 @@ fn is_primary_display(device_name: &str) -> bool {
     device_name.to_ascii_uppercase().ends_with("DISPLAY1")
 }
 
+/// Extracts the EDID model id from a Windows monitor interface path, e.g.
+/// `\\?\DISPLAY#LEN8BA1#4&2c6c98d4&0&UID8388688#{...}` -> `LEN8BA1`.
+fn display_model_from_path(path: &str) -> Option<String> {
+    let rest = path.split_once("DISPLAY#")?.1;
+    let model = rest.split('#').next()?;
+    (!model.is_empty()).then(|| model.to_string())
+}
+
 fn monitor_label(index: usize, friendly: &str, primary: bool) -> String {
     let name = friendly.trim();
     let name = if name.is_empty() { "显示器" } else { name };
@@ -361,6 +370,7 @@ fn apply_snapshot(win: &MainWindow, snapshot: Vec<MonSnapshot>, reason: Snapshot
             } else {
                 "亮度已同步".to_string()
             };
+            win.set_status_error(false);
             win.set_status_text(status.into());
         }
 
@@ -460,10 +470,19 @@ fn enumerate_devices() -> Vec<DeviceEntry> {
         match result {
             Ok(device) => {
                 let device_name = device.device_name().unwrap_or_default();
-                let friendly = device
-                    .friendly_device_name()
-                    .unwrap_or_else(|_| device_name.clone());
-                let name = monitor_label(index, &friendly, is_primary_display(&device_name));
+                let friendly = device.friendly_device_name().unwrap_or_default();
+                let model = device
+                    .device_path()
+                    .ok()
+                    .and_then(|path| display_model_from_path(&path));
+                let label_source = if !friendly.trim().is_empty() {
+                    friendly
+                } else if let Some(model) = model {
+                    model
+                } else {
+                    "显示器".to_string()
+                };
+                let name = monitor_label(index, &label_source, is_primary_display(&device_name));
                 match device.get() {
                     Ok(percent) => entries.push(DeviceEntry {
                         device: Some(device),
@@ -529,6 +548,7 @@ fn send_error(ui: &slint::Weak<MainWindow>, message: String) {
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(win) = weak.upgrade() {
             win.set_scanning(false);
+            win.set_status_error(true);
             win.set_status_text(message.into());
         }
     });
@@ -720,6 +740,7 @@ fn main() -> Result<()> {
             set_row_percent(&mut state, index, percent);
             refresh_master(&win, &state);
             queue_set(&mut state, index, percent);
+            win.set_status_error(false);
             win.set_status_text(format!("显示器 {}：{}%", index + 1, percent).into());
         });
     });
@@ -757,6 +778,7 @@ fn main() -> Result<()> {
             state.pending_all = Some(percent);
             win.set_master_percent(percent as i32);
             paint_tray(percent);
+            win.set_status_error(false);
             win.set_status_text(format!("所有显示器：{percent}%").into());
         });
     });
@@ -787,6 +809,7 @@ fn main() -> Result<()> {
     main_win.on_do_refresh(move || {
         if let Some(win) = refresh_weak.upgrade() {
             win.set_scanning(true);
+            win.set_status_error(false);
             win.set_status_text("正在扫描显示器…".into());
         }
         STATE.with(|cell| {
@@ -861,6 +884,7 @@ fn main() -> Result<()> {
     settings.on_do_refresh(move || {
         if let Some(win) = settings_refresh.upgrade() {
             win.set_scanning(true);
+            win.set_status_error(false);
             win.set_status_text("正在扫描显示器…".into());
         }
         STATE.with(|cell| {
@@ -1026,7 +1050,12 @@ fn main() -> Result<()> {
         },
     );
 
-    main_win.run()?;
+    // Tray-only daemon: Window::run() would show() the main window first,
+    // popping a visible window on launch. Our tray icon comes from the
+    // `tray-icon` crate, invisible to Slint, so run_event_loop() could exit
+    // when no window is visible. run_event_loop_until_quit() keeps the loop
+    // alive with zero visible windows until a tray callback calls quit().
+    slint::run_event_loop_until_quit()?;
     Ok(())
 }
 
@@ -1115,6 +1144,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_monitor_model_from_device_path() {
+        assert_eq!(
+            display_model_from_path(
+                r"\\?\DISPLAY#LEN8BA1#4&2c6c98d4&0&UID8388688#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"
+            ),
+            Some("LEN8BA1".to_string())
+        );
+        assert_eq!(
+            display_model_from_path(r"\\?\DISPLAY#XMID005#4&2c6c98d4&0&UID4145#{guid}"),
+            Some("XMID005".to_string())
+        );
+        assert_eq!(display_model_from_path(r"\\?\DISPLAY##4&2c6c98d4#{guid}"), None);
+        assert_eq!(display_model_from_path("garbage"), None);
+    }
+
+    #[test]
     fn icon_color_tracks_brightness() {
         assert_eq!(icon_color(0), (205, 150, 60));
         assert_eq!(icon_color(100), (255, 205, 20));
@@ -1193,6 +1238,31 @@ mod tests {
 
         let old = Some(Instant::now() - INTERACTION_GRACE - Duration::from_millis(10));
         assert!(!old.is_some_and(|touched| touched.elapsed() < INTERACTION_GRACE));
+    }
+
+    /// Read-only hardware probe. Run with:
+    /// `cargo test probe_monitors -- --ignored --nocapture`
+    /// It verifies that enumeration works from a non-main thread (the real app
+    /// uses a worker thread) without changing any brightness values.
+    #[test]
+    #[ignore]
+    fn probe_monitors() {
+        let entries = enumerate_devices();
+        println!("monitors: {}", entries.len());
+        for entry in &entries {
+            println!(
+                "  {} supported={} percent={} detail={}",
+                entry.name, entry.supported, entry.percent, entry.detail
+            );
+            if let Some(device) = &entry.device {
+                println!(
+                    "    description={:?} path={:?}",
+                    device.device_description(),
+                    device.device_path()
+                );
+            }
+        }
+        assert!(!entries.is_empty(), "no monitors enumerated");
     }
 }
 
