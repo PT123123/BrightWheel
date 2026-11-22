@@ -54,10 +54,14 @@ component BrightnessSlider inherits Rectangle {
     height: 22px;
     min-width: 60px;
 
-    private property <float> live: target;
+    private property <float> live: 0;
     private property <length> handle-size: 14px;
     private property <length> track-width: max(0px, root.width - root.handle-size);
     private property <float> ratio: root.enabled ? clamp(root.live / 100, 0, 1) : 0;
+
+    init => {
+        live = target;
+    }
 
     changed target => {
         if (!touch.pressed) {
